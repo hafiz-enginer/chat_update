@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, validator
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any
 import requests
 import os
 import json
@@ -46,6 +46,8 @@ class ChatRequest(BaseModel):
 # ----- In-memory session and cache -----
 user_session: Optional[UserDetails] = None
 cart: List[CartItem] = []
+pending_login: Dict[str, str] = {}
+user_lang: str = "en"  # default english
 
 categories_cache: List[str] = []
 items_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -81,12 +83,12 @@ def fetch_items_by_category(cat_name: str):
 # ----- NLP analysis -----
 def analyze_user_message(message: str) -> dict:
     prompt = f"""
-    Tum ek shopping chatbot ho. 
-    User ke message ko dekho aur decide karo ke konsa action lena hai.
+    Tum ek shopping chatbot ho. User ke message ko dekho aur decide karo ke konsa action lena hai.
 
     Possible actions:
     - greet
-    - login
+    - login_progress (jab user apna naam, phone ya address de raha ho)
+    - login (jab teeno fields complete ho jayein)
     - list_categories
     - list_items
     - add_to_cart
@@ -94,13 +96,18 @@ def analyze_user_message(message: str) -> dict:
     - checkout
     - logout
 
-    Agar payload zaroori ho to include karo (JSON ke form mein).
+    Saath hi user ki language detect karo:
+    - Agar user english use kar raha hai → "lang": "en"
+    - Agar user roman urdu use kar raha hai → "lang": "ur"
 
-    Example output:
-    {{
-      "action": "add_to_cart",
-      "payload": {{"name": "Apple", "quantity": 2, "price": 120}}
-    }}
+    Example:
+    User: "mera naam hamid hai"
+    Response:
+    {{"action": "login_progress", "payload": {{"name": "Hamid"}}, "lang": "ur"}}
+
+    User: "my phone number is 03124567896"
+    Response:
+    {{"action": "login_progress", "payload": {{"phone": "03124567896"}}, "lang": "en"}}
 
     User message: "{message}"
     """
@@ -112,18 +119,19 @@ def analyze_user_message(message: str) -> dict:
     try:
         return json.loads(response.choices[0].message.content)
     except:
-        return {"action": "greet", "payload": {}}
+        return {"action": "greet", "payload": {}, "lang": "en"}
 
 # ----- Unified endpoint (merged) -----
 @app.post("/chat")
 def chat(request: ChatRequest):
-    global user_session, cart
+    global user_session, cart, pending_login, user_lang
 
     # Determine action and payload
     if request.message:  # NLP path
         nlp_result = analyze_user_message(request.message)
         action = nlp_result.get("action", "greet").lower()
         payload = nlp_result.get("payload", {})
+        user_lang = nlp_result.get("lang", user_lang)  # save detected lang
     elif request.action:  # Direct action path
         action = request.action.lower()
         payload = request.payload or {}
@@ -132,14 +140,48 @@ def chat(request: ChatRequest):
 
     # ----- Action processing -----
     if action == "greet":
-        return {"message": "Assalamoalikum! 🙏\n🤖: Welcome! Please login to continue shopping.\n🤖: What's your name?"}
+        return {"message": "Assalamoalikum! 🙏\n🤖: Welcome! Let's start login.\n🤖: What's your name?" if user_lang=="en"
+                else "Assalamoalikum! 🙏\n🤖: Khush aamdeed! Login start karte hain.\n🤖: Aapka naam kya hai?"}
+
+    if action == "login_progress":
+        pending_login.update(payload)
+        missing_fields = [f for f in ["name", "phone", "address"] if f not in pending_login]
+
+        if not missing_fields:
+            try:
+                user = UserDetails(**pending_login)
+                user_session = user
+                cart.clear()
+                pending_login.clear()
+                return {"message": f"🎉 Welcome {user.name}! You are logged in." if user_lang=="en"
+                                   else f"🎉 Khush aamdeed {user.name}! Aap login ho gaye hain.",
+                        "user": user.dict()}
+            except Exception as e:
+                return {"message": f"❌ Error: {e}"}
+
+        next_field = missing_fields[0]
+
+        questions_en = {
+            "name": "🤖 What's your name?",
+            "phone": "📞 Please share your phone number (10 or 11 digits).",
+            "address": "🏠 What's your address?"
+        }
+
+        questions_ur = {
+            "name": "🤖 Aapka naam kya hai?",
+            "phone": "📞 Apna phone number dein (10 ya 11 digits).",
+            "address": "🏠 Aapka address kya hai?"
+        }
+
+        return {"message": (questions_en if user_lang=="en" else questions_ur)[next_field]}
 
     if action == "login":
         try:
             user = UserDetails(**payload)
             user_session = user
             cart.clear()
-            return {"message": f"Welcome {user.name}!", "user": user.dict()}
+            return {"message": f"Welcome {user.name}!" if user_lang=="en" else f"Khush aamdeed {user.name}!",
+                    "user": user.dict()}
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -200,6 +242,7 @@ def chat(request: ChatRequest):
     if action == "logout":
         user_session = None
         cart.clear()
-        return {"message": "Logged out and cart cleared."}
+        pending_login.clear()
+        return {"message": "Logged out and cart cleared." if user_lang=="en" else "Logout ho gaye aur cart clear kar diya gaya."}
 
     raise HTTPException(status_code=400, detail="Invalid action")
